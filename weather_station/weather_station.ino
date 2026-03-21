@@ -137,6 +137,13 @@ unsigned long lastPublish    = 0;
 unsigned long sps30StartedAt = 0;   // millis() when measurement was started
 bool          sps30Ready     = false; // true once warmup has elapsed
 
+struct Sps30Data {
+  float pm1;    // PM1.0  µg/m³
+  float pm2_5;  // PM2.5  µg/m³
+  float pm4;    // PM4.0  µg/m³
+  float pm10;   // PM10.0 µg/m³
+};
+
 // ============================================================================
 // SHT30 — READ TEMPERATURE & HUMIDITY
 // ============================================================================
@@ -216,13 +223,6 @@ bool sps30Begin() {
   delay(20);  // Execution time < 20 ms per datasheet
   return true;
 }
-
-struct Sps30Data {
-  float pm1;    // PM1.0  µg/m³
-  float pm2_5;  // PM2.5  µg/m³
-  float pm4;    // PM4.0  µg/m³
-  float pm10;   // PM10.0 µg/m³
-};
 
 // Read a fresh measurement from the SPS30.
 // Sensor must be in measurement mode (sps30Begin() called) and warmed up.
