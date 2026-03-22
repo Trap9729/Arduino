@@ -108,6 +108,9 @@ const char* mqtt_password = "mqtt_password";        // ← password for that use
 // How often to read sensors and publish to MQTT (milliseconds)
 #define PUBLISH_INTERVAL_MS 30000UL   // 30 seconds
 
+// Firmware version — bump this string each time new firmware is flashed
+#define FW_VERSION "1.0.1"
+
 // ============================================================================
 // MQTT TOPICS
 // ============================================================================
@@ -300,10 +303,11 @@ void publishDiscovery() {
     "\"dev\":{\"ids\":[\"weather_station_001\"],"
     "\"name\":\"Weather Station\",\"mf\":\"DIY\"}";
 
-  // Single buffer reused for every payload — no heap involvement.
-  // 512 bytes comfortably covers the largest discovery payload (~390 bytes
-  // including topic overhead).
-  char p[512];
+  // Static buffer reused for every payload — lives in BSS, NOT on the stack.
+  // 512 bytes comfortably covers the largest discovery payload (~390 bytes).
+  // IMPORTANT: must be static; a local char[512] eats ~92 % of the ESP8266
+  // stack (~4 KB) and causes an Exception(0) stack-overflow crash.
+  static char p[512];
 
   // ── Temperature ──────────────────────────────────────────────────────────
   snprintf(p, sizeof(p),
@@ -586,6 +590,7 @@ void setup() {
   Serial.println();
   Serial.println("================================");
   Serial.println(" WEATHER STATION STARTING");
+  Serial.print(  " Firmware v"); Serial.println(FW_VERSION);
   Serial.println("================================");
 
   // I2C — explicit pins matching hardware: SDA=GPIO4 (D2), SCL=GPIO5 (D1)
@@ -617,11 +622,19 @@ void setup() {
   pinMode(A0, INPUT);
   Serial.println("✓ Rain sensor pin A0 ready");
 
-  setupWiFi();
-
+  // Configure MQTT client before WiFi so heap is as clean as possible.
+  // setBufferSize() allocates a heap buffer; doing it early prevents
+  // fragmentation failures.  Buffer must hold a complete MQTT PUBLISH packet:
+  // headers (~10 B) + topic (~42 B) + payload (up to ~400 B) → ~450 B max;
+  // 768 B gives comfortable headroom.
   client.setServer(mqtt_server, mqtt_port);
-  client.setBufferSize(768);  // Must exceed the largest discovery payload (~390 bytes)
-  // No inbound messages expected; no callback needed
+  if (!client.setBufferSize(768)) {
+    Serial.println("✗ MQTT setBufferSize(768) FAILED — insufficient heap!");
+    // Keep going; publish() will return false for large payloads but won't crash.
+  }
+  // No inbound messages expected; no callback needed.
+
+  setupWiFi();
 
   Serial.println("================================");
   Serial.println(" Setup complete!");
