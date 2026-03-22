@@ -190,7 +190,7 @@ bool sht30Read(float &temperature, float &humidity) {
 //
 // Protocol summary:
 //   Start measurement : write [0x00,0x10, 0x03,0x00,CRC(0x03,0x00)]
-//   Read measurement  : write pointer [0x03,0x00], read 60 bytes
+//   Read measurement  : write pointer [0x03,0x00], read 24 bytes (first 4 floats — PM1.0 … PM10.0)
 //
 // Each of the 10 IEEE-754 float values is encoded as:
 //   byte0, byte1, CRC(byte0,byte1), byte2, byte3, CRC(byte2,byte3)  = 6 bytes
@@ -216,7 +216,7 @@ bool sps30Begin() {
   Wire.beginTransmission(SPS30_ADDR);
   Wire.write(0x00); Wire.write(0x10);        // command: Start Measurement
   Wire.write(0x03); Wire.write(0x00);        // sub-command: IEEE-754 float output
-  Wire.write(sps30Crc(0x03, 0x00));          // CRC of the 2 parameter bytes = 0xD3
+  Wire.write(sps30Crc(0x03, 0x00));          // CRC of the 2 parameter bytes = 0xAC
   if (Wire.endTransmission() != 0) {
     Serial.println("✗ SPS30: start measurement command failed");
     return false;
@@ -283,19 +283,6 @@ String precipLabel(int raw, float temp) {
   if (raw >= RAIN_LIGHT)    { String s = "Light ";    s += kind; return s; }
   if (raw >= RAIN_MODERATE) { String s = "Moderate "; s += kind; return s; }
   {                           String s = "Heavy ";    s += kind; return s; }
-}
-
-// Returns an appropriate MDI icon for the precipitation state.
-const char* precipIcon(int raw, float temp) {
-  if (raw >= RAIN_DRY)    return "mdi:weather-sunny";
-  if (temp < 0.0f) {
-    if (raw >= RAIN_LIGHT)    return "mdi:weather-snowy";
-    if (raw >= RAIN_MODERATE) return "mdi:weather-snowy-heavy";
-    return "mdi:weather-snowy-heavy";
-  }
-  if (raw >= RAIN_LIGHT)    return "mdi:weather-rainy";
-  if (raw >= RAIN_MODERATE) return "mdi:weather-pouring";
-  return "mdi:weather-pouring";
 }
 
 // ============================================================================
@@ -619,6 +606,8 @@ void setup() {
       Serial.print("✓ SPS30 measurement started (warming up for ");
       Serial.print(SPS30_WARMUP_MS / 1000);
       Serial.println("s)");
+    } else {
+      Serial.println("✗ SPS30 start failed — PM readings disabled");
     }
   } else {
     Serial.println("✗ NOT found — check 5V supply, SEL→GND, and SDA/SCL wiring!");
