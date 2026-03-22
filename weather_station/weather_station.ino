@@ -140,6 +140,7 @@ unsigned long lastPublish    = 0;
 unsigned long sps30StartedAt = 0;   // millis() when measurement was started
 bool          sps30Ready     = false; // true once warmup has elapsed
 bool          sps30Present   = false; // true only if sps30Begin() succeeded
+int8_t        discoveryStep  = -1;   // -1 = idle; 0-7 = step to publish next
 
 struct Sps30Data {
   float pm1;    // PM1.0  µg/m³
@@ -288,172 +289,148 @@ const char* precipLabel(int raw, float temp) {
 }
 
 // ============================================================================
-// MQTT DISCOVERY — publish once on (re)connect
+// MQTT DISCOVERY — one message per loop() iteration
 // ============================================================================
-// Each entity shares the same device block so HA groups them under one device.
-// Payloads are built into a stack-allocated char array with snprintf to avoid
-// repeated heap allocations (Arduino String fragmentation on ESP8266 causes
-// malloc to return NULL for the 8th payload, crashing at address 0x00000000).
+// Publishing all 8 payloads in a tight loop overwhelms the ESP8266 TCP send
+// buffer and starves the hardware watchdog (rst cause:4).  Instead, each call
+// publishes exactly ONE message; loop() calls this once per iteration so that
+// client.loop() and the SDK background tasks run between every publish,
+// keeping the WDT alive and draining the TCP send buffer.
+//
+// discoveryStep (global) tracks progress:
+//   -1 → idle (no discovery needed)
+//    0–7 → index of the message to publish on the next call
+// When loop() sees discoveryStep == 8 it prints "Discovery complete." and
+// resets discoveryStep to -1.
 
-void publishDiscovery() {
-  Serial.println("Publishing MQTT discovery...");
+// No-op callback — registered so PubSubClient never calls a NULL function
+// pointer if the broker unexpectedly sends us a PUBLISH packet.
+void mqttCallback(char* /*topic*/, byte* /*payload*/, unsigned int /*len*/) {}
 
-  // Shared device fragment (appended to every payload)
+void publishDiscoveryStep(int8_t step) {
+  // BSS-resident buffer — NOT on the stack (a local char[512] consumes ~92 %
+  // of the ESP8266 user stack and causes an Exception(0) crash).
+  static char p[512];
+
   const char* devFrag =
     "\"dev\":{\"ids\":[\"weather_station_001\"],"
     "\"name\":\"Weather Station\",\"mf\":\"DIY\"}";
 
-  // Static buffer reused for every payload — lives in BSS, NOT on the stack.
-  // 512 bytes comfortably covers the largest discovery payload (~390 bytes).
-  // IMPORTANT: must be static; a local char[512] eats ~92 % of the ESP8266
-  // stack (~4 KB) and causes an Exception(0) stack-overflow crash.
-  static char p[512];
+  const char* topic = nullptr;
+  const char* label = nullptr;
 
-  // ── Temperature ──────────────────────────────────────────────────────────
-  snprintf(p, sizeof(p),
-    "{\"name\":\"Outside Temperature\","
-    "\"uniq_id\":\"ws001_temp\","
-    "\"dev_cla\":\"temperature\","
-    "\"unit_of_meas\":\"\xc2\xb0""C\","   // °C (UTF-8)
-    "\"stat_t\":\"" STATE_TOPIC "\","
-    "\"val_tpl\":\"{{ value_json.temperature }}\","
-    "\"avty_t\":\"" AVAIL_TOPIC "\","
-    "\"pl_avail\":\"online\","
-    "\"pl_not_avail\":\"offline\",%s}", devFrag);
-  {
-    bool ok = client.publish(DISC_TEMP, p, true);
-    Serial.print(ok ? "  ✓ temp   " : "  ✗ temp   ");
-    Serial.print(strlen(p)); Serial.println(" bytes");
-    delay(100);
+  switch (step) {
+    case 0:
+      snprintf(p, sizeof(p),
+        "{\"name\":\"Outside Temperature\","
+        "\"uniq_id\":\"ws001_temp\","
+        "\"dev_cla\":\"temperature\","
+        "\"unit_of_meas\":\"\xc2\xb0""C\","   // °C (UTF-8)
+        "\"stat_t\":\"" STATE_TOPIC "\","
+        "\"val_tpl\":\"{{ value_json.temperature }}\","
+        "\"avty_t\":\"" AVAIL_TOPIC "\","
+        "\"pl_avail\":\"online\","
+        "\"pl_not_avail\":\"offline\",%s}", devFrag);
+      topic = DISC_TEMP;  label = "temp  "; break;
+
+    case 1:
+      snprintf(p, sizeof(p),
+        "{\"name\":\"Outside Humidity\","
+        "\"uniq_id\":\"ws001_humid\","
+        "\"dev_cla\":\"humidity\","
+        "\"unit_of_meas\":\"%%\","
+        "\"stat_t\":\"" STATE_TOPIC "\","
+        "\"val_tpl\":\"{{ value_json.humidity }}\","
+        "\"avty_t\":\"" AVAIL_TOPIC "\","
+        "\"pl_avail\":\"online\","
+        "\"pl_not_avail\":\"offline\",%s}", devFrag);
+      topic = DISC_HUMID;  label = "humid "; break;
+
+    case 2:
+      snprintf(p, sizeof(p),
+        "{\"name\":\"Outside Precipitation\","
+        "\"uniq_id\":\"ws001_precip\","
+        "\"stat_t\":\"" STATE_TOPIC "\","
+        "\"val_tpl\":\"{{ value_json.precip_label }}\","
+        "\"icon\":\"mdi:weather-rainy\","
+        "\"avty_t\":\"" AVAIL_TOPIC "\","
+        "\"pl_avail\":\"online\","
+        "\"pl_not_avail\":\"offline\",%s}", devFrag);
+      topic = DISC_PRECIP;  label = "precip"; break;
+
+    case 3:
+      snprintf(p, sizeof(p),
+        "{\"name\":\"Rain Sensor Raw\","
+        "\"uniq_id\":\"ws001_rain_raw\","
+        "\"stat_t\":\"" STATE_TOPIC "\","
+        "\"val_tpl\":\"{{ value_json.rain_raw }}\","
+        "\"entity_cat\":\"diagnostic\","
+        "\"icon\":\"mdi:water-percent\","
+        "\"avty_t\":\"" AVAIL_TOPIC "\","
+        "\"pl_avail\":\"online\","
+        "\"pl_not_avail\":\"offline\",%s}", devFrag);
+      topic = DISC_RAW;  label = "raw   "; break;
+
+    case 4:
+      snprintf(p, sizeof(p),
+        "{\"name\":\"Air Quality PM1.0\","
+        "\"uniq_id\":\"ws001_pm1\","
+        "\"dev_cla\":\"pm1\","
+        "\"unit_of_meas\":\"\xc2\xb5g/m\xc2\xb3\","  // µg/m³ (UTF-8)
+        "\"stat_t\":\"" STATE_TOPIC "\","
+        "\"val_tpl\":\"{{ value_json.pm1 }}\","
+        "\"avty_t\":\"" AVAIL_TOPIC "\","
+        "\"pl_avail\":\"online\","
+        "\"pl_not_avail\":\"offline\",%s}", devFrag);
+      topic = DISC_PM1;  label = "pm1   "; break;
+
+    case 5:
+      snprintf(p, sizeof(p),
+        "{\"name\":\"Air Quality PM2.5\","
+        "\"uniq_id\":\"ws001_pm25\","
+        "\"dev_cla\":\"pm25\","
+        "\"unit_of_meas\":\"\xc2\xb5g/m\xc2\xb3\","
+        "\"stat_t\":\"" STATE_TOPIC "\","
+        "\"val_tpl\":\"{{ value_json.pm25 }}\","
+        "\"avty_t\":\"" AVAIL_TOPIC "\","
+        "\"pl_avail\":\"online\","
+        "\"pl_not_avail\":\"offline\",%s}", devFrag);
+      topic = DISC_PM25;  label = "pm25  "; break;
+
+    case 6:
+      // No standard HA device class for PM4; use air-filter icon instead.
+      snprintf(p, sizeof(p),
+        "{\"name\":\"Air Quality PM4.0\","
+        "\"uniq_id\":\"ws001_pm4\","
+        "\"unit_of_meas\":\"\xc2\xb5g/m\xc2\xb3\","
+        "\"icon\":\"mdi:air-filter\","
+        "\"stat_t\":\"" STATE_TOPIC "\","
+        "\"val_tpl\":\"{{ value_json.pm4 }}\","
+        "\"avty_t\":\"" AVAIL_TOPIC "\","
+        "\"pl_avail\":\"online\","
+        "\"pl_not_avail\":\"offline\",%s}", devFrag);
+      topic = DISC_PM4;  label = "pm4   "; break;
+
+    case 7:
+      snprintf(p, sizeof(p),
+        "{\"name\":\"Air Quality PM10.0\","
+        "\"uniq_id\":\"ws001_pm10\","
+        "\"dev_cla\":\"pm10\","
+        "\"unit_of_meas\":\"\xc2\xb5g/m\xc2\xb3\","
+        "\"stat_t\":\"" STATE_TOPIC "\","
+        "\"val_tpl\":\"{{ value_json.pm10 }}\","
+        "\"avty_t\":\"" AVAIL_TOPIC "\","
+        "\"pl_avail\":\"online\","
+        "\"pl_not_avail\":\"offline\",%s}", devFrag);
+      topic = DISC_PM10;  label = "pm10  "; break;
+
+    default: return;  // out of range — ignore
   }
 
-  // ── Humidity ─────────────────────────────────────────────────────────────
-  snprintf(p, sizeof(p),
-    "{\"name\":\"Outside Humidity\","
-    "\"uniq_id\":\"ws001_humid\","
-    "\"dev_cla\":\"humidity\","
-    "\"unit_of_meas\":\"%%\","             // %% → literal % in snprintf output
-    "\"stat_t\":\"" STATE_TOPIC "\","
-    "\"val_tpl\":\"{{ value_json.humidity }}\","
-    "\"avty_t\":\"" AVAIL_TOPIC "\","
-    "\"pl_avail\":\"online\","
-    "\"pl_not_avail\":\"offline\",%s}", devFrag);
-  {
-    bool ok = client.publish(DISC_HUMID, p, true);
-    Serial.print(ok ? "  ✓ humid  " : "  ✗ humid  ");
-    Serial.print(strlen(p)); Serial.println(" bytes");
-    delay(100);
-  }
-
-  // ── Precipitation label ───────────────────────────────────────────────────
-  snprintf(p, sizeof(p),
-    "{\"name\":\"Outside Precipitation\","
-    "\"uniq_id\":\"ws001_precip\","
-    "\"stat_t\":\"" STATE_TOPIC "\","
-    "\"val_tpl\":\"{{ value_json.precip_label }}\","
-    "\"icon\":\"mdi:weather-rainy\","
-    "\"avty_t\":\"" AVAIL_TOPIC "\","
-    "\"pl_avail\":\"online\","
-    "\"pl_not_avail\":\"offline\",%s}", devFrag);
-  {
-    bool ok = client.publish(DISC_PRECIP, p, true);
-    Serial.print(ok ? "  ✓ precip " : "  ✗ precip ");
-    Serial.print(strlen(p)); Serial.println(" bytes");
-    delay(100);
-  }
-
-  // ── Rain sensor raw (diagnostic) ─────────────────────────────────────────
-  snprintf(p, sizeof(p),
-    "{\"name\":\"Rain Sensor Raw\","
-    "\"uniq_id\":\"ws001_rain_raw\","
-    "\"stat_t\":\"" STATE_TOPIC "\","
-    "\"val_tpl\":\"{{ value_json.rain_raw }}\","
-    "\"entity_cat\":\"diagnostic\","
-    "\"icon\":\"mdi:water-percent\","
-    "\"avty_t\":\"" AVAIL_TOPIC "\","
-    "\"pl_avail\":\"online\","
-    "\"pl_not_avail\":\"offline\",%s}", devFrag);
-  {
-    bool ok = client.publish(DISC_RAW, p, true);
-    Serial.print(ok ? "  ✓ raw    " : "  ✗ raw    ");
-    Serial.print(strlen(p)); Serial.println(" bytes");
-    delay(100);
-  }
-
-  // ── SPS30: PM1.0 ─────────────────────────────────────────────────────────
-  snprintf(p, sizeof(p),
-    "{\"name\":\"Air Quality PM1.0\","
-    "\"uniq_id\":\"ws001_pm1\","
-    "\"dev_cla\":\"pm1\","
-    "\"unit_of_meas\":\"\xc2\xb5g/m\xc2\xb3\","  // µg/m³ (UTF-8)
-    "\"stat_t\":\"" STATE_TOPIC "\","
-    "\"val_tpl\":\"{{ value_json.pm1 }}\","
-    "\"avty_t\":\"" AVAIL_TOPIC "\","
-    "\"pl_avail\":\"online\","
-    "\"pl_not_avail\":\"offline\",%s}", devFrag);
-  {
-    bool ok = client.publish(DISC_PM1, p, true);
-    Serial.print(ok ? "  ✓ pm1    " : "  ✗ pm1    ");
-    Serial.print(strlen(p)); Serial.println(" bytes");
-    delay(100);
-  }
-
-  // ── SPS30: PM2.5 ─────────────────────────────────────────────────────────
-  snprintf(p, sizeof(p),
-    "{\"name\":\"Air Quality PM2.5\","
-    "\"uniq_id\":\"ws001_pm25\","
-    "\"dev_cla\":\"pm25\","
-    "\"unit_of_meas\":\"\xc2\xb5g/m\xc2\xb3\","
-    "\"stat_t\":\"" STATE_TOPIC "\","
-    "\"val_tpl\":\"{{ value_json.pm25 }}\","
-    "\"avty_t\":\"" AVAIL_TOPIC "\","
-    "\"pl_avail\":\"online\","
-    "\"pl_not_avail\":\"offline\",%s}", devFrag);
-  {
-    bool ok = client.publish(DISC_PM25, p, true);
-    Serial.print(ok ? "  ✓ pm25   " : "  ✗ pm25   ");
-    Serial.print(strlen(p)); Serial.println(" bytes");
-    delay(100);
-  }
-
-  // ── SPS30: PM4.0 ─────────────────────────────────────────────────────────
-  // No standard HA device class for PM4; use air-filter icon instead.
-  snprintf(p, sizeof(p),
-    "{\"name\":\"Air Quality PM4.0\","
-    "\"uniq_id\":\"ws001_pm4\","
-    "\"unit_of_meas\":\"\xc2\xb5g/m\xc2\xb3\","
-    "\"icon\":\"mdi:air-filter\","
-    "\"stat_t\":\"" STATE_TOPIC "\","
-    "\"val_tpl\":\"{{ value_json.pm4 }}\","
-    "\"avty_t\":\"" AVAIL_TOPIC "\","
-    "\"pl_avail\":\"online\","
-    "\"pl_not_avail\":\"offline\",%s}", devFrag);
-  {
-    bool ok = client.publish(DISC_PM4, p, true);
-    Serial.print(ok ? "  ✓ pm4    " : "  ✗ pm4    ");
-    Serial.print(strlen(p)); Serial.println(" bytes");
-    delay(100);
-  }
-
-  // ── SPS30: PM10.0 ────────────────────────────────────────────────────────
-  snprintf(p, sizeof(p),
-    "{\"name\":\"Air Quality PM10.0\","
-    "\"uniq_id\":\"ws001_pm10\","
-    "\"dev_cla\":\"pm10\","
-    "\"unit_of_meas\":\"\xc2\xb5g/m\xc2\xb3\","
-    "\"stat_t\":\"" STATE_TOPIC "\","
-    "\"val_tpl\":\"{{ value_json.pm10 }}\","
-    "\"avty_t\":\"" AVAIL_TOPIC "\","
-    "\"pl_avail\":\"online\","
-    "\"pl_not_avail\":\"offline\",%s}", devFrag);
-  {
-    bool ok = client.publish(DISC_PM10, p, true);
-    Serial.print(ok ? "  ✓ pm10   " : "  ✗ pm10   ");
-    Serial.print(strlen(p)); Serial.println(" bytes");
-    delay(100);
-  }
-
-  Serial.println("Discovery complete.");
+  bool ok = client.publish(topic, p, true);
+  Serial.print(ok ? "  ✓ " : "  ✗ ");
+  Serial.print(label);
+  Serial.print(strlen(p)); Serial.println(" bytes");
 }
 
 // ============================================================================
@@ -571,8 +548,10 @@ void reconnectMQTT() {
                      AVAIL_TOPIC, 0, true, "offline")) {
     Serial.println(" ✓");
     client.publish(AVAIL_TOPIC, "online", true);
-    publishDiscovery();
-    lastPublish = 0;  // Force immediate sensor publish
+    // Schedule discovery: loop() will publish one message per iteration so
+    // the TCP stack and watchdog are serviced between each payload.
+    discoveryStep = 0;
+    Serial.println("Publishing MQTT discovery...");
   } else {
     Serial.print(" ✗ rc=");
     Serial.print(client.state());
@@ -628,11 +607,12 @@ void setup() {
   // headers (~10 B) + topic (~42 B) + payload (up to ~400 B) → ~450 B max;
   // 768 B gives comfortable headroom.
   client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqttCallback);  // Prevents NULL-pointer crash if broker
+                                     // sends an unexpected PUBLISH packet.
   if (!client.setBufferSize(768)) {
     Serial.println("✗ MQTT setBufferSize(768) FAILED — insufficient heap!");
     // Keep going; publish() will return false for large payloads but won't crash.
   }
-  // No inbound messages expected; no callback needed.
 
   setupWiFi();
 
@@ -656,12 +636,31 @@ void setup() {
 void loop() {
   if (!client.connected()) {
     reconnectMQTT();
-    delay(5000);
+    if (!client.connected()) {
+      delay(5000);  // Back-off only on connection failure
+    }
     return;
   }
 
+  // Service MQTT keep-alive and drain any incoming data before every action.
+  // This also feeds the watchdog via the SDK background tasks.
   client.loop();
 
+  // ── Discovery: publish one message per iteration ──────────────────────────
+  // Spacing each payload across separate loop() calls gives the TCP send
+  // buffer and watchdog time to recover between the large retained publishes.
+  if (discoveryStep >= 0) {
+    publishDiscoveryStep(discoveryStep);
+    discoveryStep++;
+    if (discoveryStep >= 8) {
+      discoveryStep = -1;
+      Serial.println("Discovery complete.");
+      lastPublish = 0;  // Trigger first sensor publish after discovery
+    }
+    return;
+  }
+
+  // ── Normal sensor publishing ──────────────────────────────────────────────
   unsigned long now = millis();
   if (now - lastPublish >= PUBLISH_INTERVAL_MS) {
     lastPublish = now;
