@@ -510,23 +510,29 @@ void setupWiFi() {
   Serial.print(ssid);
   Serial.print("\"");
 
-  // Reset WiFi hardware before every begin().  A WDT reset leaves the radio
-  // in a partially initialised state that causes Exception(28)/excvaddr=0x38
-  // crashes on the next WiFi.begin() (esp8266/Arduino #4078, #6172).
-  // persistent(false) prevents credentials being written to flash, which can
-  // corrupt the config sector if a WDT fires mid-write and cause boot loops
-  // (#3852).
+  // WiFi.begin() must be called EXACTLY ONCE per boot.  Calling it again
+  // after a crash/reconnect hits a bug in the ESP8266 WiFi library
+  // (esp8266/Arduino #4078, #6172) that corrupts lwIP PCBs and causes
+  // Exception(0/28) crashes.
+  //
+  // Strategy:
+  //   • persistent(false)      — never write credentials to flash; mid-write
+  //                              corruption causes boot-loops (#3852)
+  //   • setAutoReconnect(true) — SDK reconnects automatically if the AP drops;
+  //                              we never need to call begin() a second time
+  //   • disconnect(true)       — clears stale lwIP state from a previous WDT
+  //                              reset; also calls WiFi.mode(WIFI_OFF)
+  //   • delay(200)             — let the radio fully power down before begin()
   WiFi.persistent(false);
   WiFi.setAutoConnect(false);
-  WiFi.setAutoReconnect(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true);   // clears stale lwIP PCBs left by the WDT reset
-  delay(100);              // SDK needs time to complete teardown — do not skip
+  WiFi.setAutoReconnect(true);   // SDK handles reconnects; we never call begin() again
+  WiFi.disconnect(true);         // clear stale PCBs; puts radio in WIFI_OFF
+  delay(200);                    // radio needs > 100 ms to fully power down
 
-  WiFi.begin(ssid, password);
+  WiFi.begin(ssid, password);   // implicitly enables WIFI_STA
 
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
     delay(500);
     Serial.print(".");
     attempts++;
@@ -537,7 +543,11 @@ void setupWiFi() {
     Serial.print("✓ WiFi connected! IP: ");
     Serial.println(WiFi.localIP());
   } else {
-    Serial.println("✗ WiFi FAILED — check SSID/password and 2.4 GHz band");
+    // Failed to associate after 10 s.  Restart cleanly rather than
+    // continuing in a broken state — a clean boot will retry from scratch.
+    Serial.println("✗ WiFi FAILED — restarting in 10 s");
+    delay(10000);
+    ESP.restart();
   }
 }
 
@@ -546,9 +556,11 @@ void setupWiFi() {
 // ============================================================================
 
 void reconnectMQTT() {
+  // WiFi reconnection is handled by setAutoReconnect(true) in the SDK.
+  // Never call setupWiFi() / WiFi.begin() here — doing so is what caused
+  // the repeated Exception(0/28) WiFi library crashes.
   if (WiFi.status() != WL_CONNECTED) {
-    setupWiFi();
-    return;
+    return;  // Wait; the SDK will re-associate in the background
   }
 
   Serial.print("Connecting to MQTT at ");
