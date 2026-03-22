@@ -136,6 +136,7 @@ PubSubClient client(espClient);
 unsigned long lastPublish    = 0;
 unsigned long sps30StartedAt = 0;   // millis() when measurement was started
 bool          sps30Ready     = false; // true once warmup has elapsed
+bool          sps30Present   = false; // true only if sps30Begin() succeeded
 
 struct Sps30Data {
   float pm1;    // PM1.0  µg/m³
@@ -189,7 +190,7 @@ bool sht30Read(float &temperature, float &humidity) {
 //
 // Protocol summary:
 //   Start measurement : write [0x00,0x10, 0x03,0x00,CRC(0x03,0x00)]
-//   Read measurement  : write pointer [0x03,0x00], read 60 bytes
+//   Read measurement  : write pointer [0x03,0x00], read 24 bytes (first 4 floats — PM1.0 … PM10.0)
 //
 // Each of the 10 IEEE-754 float values is encoded as:
 //   byte0, byte1, CRC(byte0,byte1), byte2, byte3, CRC(byte2,byte3)  = 6 bytes
@@ -215,7 +216,7 @@ bool sps30Begin() {
   Wire.beginTransmission(SPS30_ADDR);
   Wire.write(0x00); Wire.write(0x10);        // command: Start Measurement
   Wire.write(0x03); Wire.write(0x00);        // sub-command: IEEE-754 float output
-  Wire.write(sps30Crc(0x03, 0x00));          // CRC of the 2 parameter bytes = 0xD3
+  Wire.write(sps30Crc(0x03, 0x00));          // CRC of the 2 parameter bytes = 0xAC
   if (Wire.endTransmission() != 0) {
     Serial.println("✗ SPS30: start measurement command failed");
     return false;
@@ -235,15 +236,17 @@ bool sps30Read(Sps30Data &d) {
     return false;
   }
 
-  // 10 floats × 6 bytes each = 60 bytes
-  // ESP8266 Wire buffer is 128 bytes — this fits comfortably.
-  if (Wire.requestFrom((uint8_t)SPS30_ADDR, (uint8_t)60) < 60) {
+  // Read only the first 4 floats (PM1.0, PM2.5, PM4.0, PM10.0 = 24 bytes).
+  // The SPS30 sends 60 bytes total, but the I2C master controls how many it
+  // reads; the bus issues NACK+STOP after byte 24, which the sensor accepts.
+  // Requesting 24 bytes (< 32) is safe on all ESP8266 Arduino Core versions.
+  if (Wire.requestFrom((uint8_t)SPS30_ADDR, (uint8_t)24) < 24) {
     Serial.println("✗ SPS30: short read");
     return false;
   }
 
-  uint8_t raw[60];
-  for (int i = 0; i < 60; i++) raw[i] = Wire.read();
+  uint8_t raw[24];
+  for (int i = 0; i < 24; i++) raw[i] = Wire.read();
 
   // Parse the first four floats (PM1.0, PM2.5, PM4.0, PM10.0).
   // Each float occupies 6 bytes: b0 b1 CRC01 b2 b3 CRC23.
@@ -280,19 +283,6 @@ String precipLabel(int raw, float temp) {
   if (raw >= RAIN_LIGHT)    { String s = "Light ";    s += kind; return s; }
   if (raw >= RAIN_MODERATE) { String s = "Moderate "; s += kind; return s; }
   {                           String s = "Heavy ";    s += kind; return s; }
-}
-
-// Returns an appropriate MDI icon for the precipitation state.
-const char* precipIcon(int raw, float temp) {
-  if (raw >= RAIN_DRY)    return "mdi:weather-sunny";
-  if (temp < 0.0f) {
-    if (raw >= RAIN_LIGHT)    return "mdi:weather-snowy";
-    if (raw >= RAIN_MODERATE) return "mdi:weather-snowy-heavy";
-    return "mdi:weather-snowy-heavy";
-  }
-  if (raw >= RAIN_LIGHT)    return "mdi:weather-rainy";
-  if (raw >= RAIN_MODERATE) return "mdi:weather-pouring";
-  return "mdi:weather-pouring";
 }
 
 // ============================================================================
@@ -497,28 +487,29 @@ void publishSensorData() {
   payload += "\"precip_label\":\"" + label + "\",";
   payload += "\"rain_raw\":"       + String(raw);
 
-  // SPS30 PM readings — only appended once the sensor has warmed up
+  // SPS30 PM readings — only attempted if sps30Begin() succeeded
   unsigned long now = millis();
-  if (!sps30Ready && (now - sps30StartedAt) >= SPS30_WARMUP_MS) {
-    sps30Ready = true;
-    Serial.println("✓ SPS30 warmup complete");
-  }
-
-  if (sps30Ready) {
-    Sps30Data pm;
-    if (sps30Read(pm)) {
-      payload += ",\"pm1\":"  + String(pm.pm1,   1);
-      payload += ",\"pm25\":" + String(pm.pm2_5, 1);
-      payload += ",\"pm4\":"  + String(pm.pm4,   1);
-      payload += ",\"pm10\":" + String(pm.pm10,  1);
-    } else {
-      Serial.println("✗ SPS30 read failed — PM values omitted this cycle");
+  if (sps30Present) {
+    if (!sps30Ready && (now - sps30StartedAt) >= SPS30_WARMUP_MS) {
+      sps30Ready = true;
+      Serial.println("✓ SPS30 warmup complete");
     }
-  } else {
-    unsigned long remaining = (SPS30_WARMUP_MS - (now - sps30StartedAt)) / 1000UL;
-    Serial.print("  SPS30 warming up... ");
-    Serial.print(remaining);
-    Serial.println("s remaining");
+    if (sps30Ready) {
+      Sps30Data pm;
+      if (sps30Read(pm)) {
+        payload += ",\"pm1\":"  + String(pm.pm1,   1);
+        payload += ",\"pm25\":" + String(pm.pm2_5, 1);
+        payload += ",\"pm4\":"  + String(pm.pm4,   1);
+        payload += ",\"pm10\":" + String(pm.pm10,  1);
+      } else {
+        Serial.println("✗ SPS30 read failed — PM values omitted this cycle");
+      }
+    } else {
+      unsigned long remaining = (SPS30_WARMUP_MS - (now - sps30StartedAt)) / 1000UL;
+      Serial.print("  SPS30 warming up... ");
+      Serial.print(remaining);
+      Serial.println("s remaining");
+    }
   }
 
   payload += "}";
@@ -610,10 +601,13 @@ void setup() {
   if (Wire.endTransmission() == 0) {
     Serial.println("✓ found");
     if (sps30Begin()) {
+      sps30Present   = true;
       sps30StartedAt = millis();
       Serial.print("✓ SPS30 measurement started (warming up for ");
       Serial.print(SPS30_WARMUP_MS / 1000);
       Serial.println("s)");
+    } else {
+      Serial.println("✗ SPS30 start failed — PM readings disabled");
     }
   } else {
     Serial.println("✗ NOT found — check 5V supply, SEL→GND, and SDA/SCL wiring!");
