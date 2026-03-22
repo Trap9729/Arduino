@@ -267,7 +267,7 @@ bool sps30Read(Sps30Data &d) {
 // Below 0 °C the water on the sensor is assumed to be snow.
 
 // Returns a short machine-readable type string for automation triggers etc.
-String precipType(int raw, float temp) {
+const char* precipType(int raw, float temp) {
   if (raw >= RAIN_DRY)      return "none";
   bool snow = (temp < 0.0f);
   if (raw >= RAIN_LIGHT)    return snow ? "light_snow"    : "light_rain";
@@ -276,13 +276,12 @@ String precipType(int raw, float temp) {
 }
 
 // Returns a human-readable label shown in the HA frontend card.
-String precipLabel(int raw, float temp) {
+const char* precipLabel(int raw, float temp) {
   if (raw >= RAIN_DRY)      return "None";
   bool snow = (temp < 0.0f);
-  const char* kind = snow ? "Snow" : "Rain";
-  if (raw >= RAIN_LIGHT)    { String s = "Light ";    s += kind; return s; }
-  if (raw >= RAIN_MODERATE) { String s = "Moderate "; s += kind; return s; }
-  {                           String s = "Heavy ";    s += kind; return s; }
+  if (raw >= RAIN_LIGHT)    return snow ? "Light Snow"    : "Light Rain";
+  if (raw >= RAIN_MODERATE) return snow ? "Moderate Snow" : "Moderate Rain";
+  return                           snow ? "Heavy Snow"    : "Heavy Rain";
 }
 
 // ============================================================================
@@ -464,17 +463,17 @@ void publishSensorData() {
     return;
   }
 
-  int   raw   = analogRead(A0);
-  String type  = precipType(raw, temp);
-  String label = precipLabel(raw, temp);
+  int         raw   = analogRead(A0);
+  const char* type  = precipType(raw, temp);
+  const char* label = precipLabel(raw, temp);
 
-  // Build JSON payload
-  String payload = "{";
-  payload += "\"temperature\":"   + String(temp,  1) + ",";
-  payload += "\"humidity\":"      + String(humid, 1) + ",";
-  payload += "\"precip_type\":\""  + type  + "\",";
-  payload += "\"precip_label\":\"" + label + "\",";
-  payload += "\"rain_raw\":"       + String(raw);
+  // Build JSON payload into a fixed stack buffer — no heap allocation.
+  char payload[256];
+  int  len = snprintf(payload, sizeof(payload),
+               "{\"temperature\":%.1f,\"humidity\":%.1f,"
+               "\"precip_type\":\"%s\",\"precip_label\":\"%s\","
+               "\"rain_raw\":%d",
+               temp, humid, type, label, raw);
 
   // SPS30 PM readings — only attempted if sps30Begin() succeeded
   unsigned long now = millis();
@@ -486,10 +485,9 @@ void publishSensorData() {
     if (sps30Ready) {
       Sps30Data pm;
       if (sps30Read(pm)) {
-        payload += ",\"pm1\":"  + String(pm.pm1,   1);
-        payload += ",\"pm25\":" + String(pm.pm2_5, 1);
-        payload += ",\"pm4\":"  + String(pm.pm4,   1);
-        payload += ",\"pm10\":" + String(pm.pm10,  1);
+        len += snprintf(payload + len, sizeof(payload) - len,
+                 ",\"pm1\":%.1f,\"pm25\":%.1f,\"pm4\":%.1f,\"pm10\":%.1f",
+                 pm.pm1, pm.pm2_5, pm.pm4, pm.pm10);
       } else {
         Serial.println("✗ SPS30 read failed — PM values omitted this cycle");
       }
@@ -501,9 +499,11 @@ void publishSensorData() {
     }
   }
 
-  payload += "}";
+  // Close the JSON object
+  payload[len++] = '}';
+  payload[len]   = '\0';
 
-  bool ok = client.publish(STATE_TOPIC, payload.c_str(), true);
+  bool ok = client.publish(STATE_TOPIC, payload, true);
   Serial.print(ok ? "✓ Published: " : "✗ Failed:   ");
   Serial.println(payload);
 }
@@ -577,8 +577,8 @@ void setup() {
   Serial.println(" WEATHER STATION STARTING");
   Serial.println("================================");
 
-  // I2C — default NodeMCU/D1 pins: SDA=D2 (GPIO4), SCL=D1 (GPIO5)
-  Wire.begin();
+  // I2C — explicit pins matching hardware: SDA=GPIO4 (D2), SCL=GPIO5 (D1)
+  Wire.begin(4, 5);
   Wire.setClock(100000);  // 100 kHz — safe for both SHT30 and SPS30
 
   Serial.print("SHT30 I2C scan... ");
