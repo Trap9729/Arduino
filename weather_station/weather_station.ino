@@ -467,13 +467,19 @@ void publishSensorData() {
   const char* type  = precipType(raw, temp);
   const char* label = precipLabel(raw, temp);
 
+  // ESP8266 newlib-nano does not enable %f/%g in snprintf by default.
+  // dtostrf() is always available on Arduino and sidesteps the issue.
+  char sTemp[8], sHumid[8];
+  dtostrf(temp,  1, 1, sTemp);
+  dtostrf(humid, 1, 1, sHumid);
+
   // Build JSON payload into a fixed stack buffer — no heap allocation.
   char payload[256];
   int  len = snprintf(payload, sizeof(payload),
-               "{\"temperature\":%.1f,\"humidity\":%.1f,"
+               "{\"temperature\":%s,\"humidity\":%s,"
                "\"precip_type\":\"%s\",\"precip_label\":\"%s\","
                "\"rain_raw\":%d",
-               temp, humid, type, label, raw);
+               sTemp, sHumid, type, label, raw);
 
   // SPS30 PM readings — only attempted if sps30Begin() succeeded
   unsigned long now = millis();
@@ -485,9 +491,14 @@ void publishSensorData() {
     if (sps30Ready) {
       Sps30Data pm;
       if (sps30Read(pm)) {
+        char sPm1[8], sPm25[8], sPm4[8], sPm10[8];
+        dtostrf(pm.pm1,   1, 1, sPm1);
+        dtostrf(pm.pm2_5, 1, 1, sPm25);
+        dtostrf(pm.pm4,   1, 1, sPm4);
+        dtostrf(pm.pm10,  1, 1, sPm10);
         len += snprintf(payload + len, sizeof(payload) - len,
-                 ",\"pm1\":%.1f,\"pm25\":%.1f,\"pm4\":%.1f,\"pm10\":%.1f",
-                 pm.pm1, pm.pm2_5, pm.pm4, pm.pm10);
+                 ",\"pm1\":%s,\"pm25\":%s,\"pm4\":%s,\"pm10\":%s",
+                 sPm1, sPm25, sPm4, sPm10);
       } else {
         Serial.println("✗ SPS30 read failed — PM values omitted this cycle");
       }
