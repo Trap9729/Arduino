@@ -294,172 +294,136 @@ String precipLabel(int raw, float temp) {
 
 void publishDiscovery() {
   Serial.println("Publishing MQTT discovery...");
-  client.setBufferSize(768);  // Increased to accommodate SPS30 discovery payloads
 
-  // Shared device fragment (appended to every payload)
-  const char* devFrag =
+  // Static char buffer — lives in BSS (not heap, not stack).
+  // Using snprintf instead of String avoids heap allocations entirely,
+  // which previously fragmented the ESP8266 heap and caused setBufferSize()
+  // to return a NULL buffer that crashed client.loop() with exception 28.
+  static char p[512];
+
+  // Shared suffix: availability config + device block + closing '}'.
+  // Appended to every entity payload via the trailing %s in each snprintf.
+  const char* sfx =
+    "\"avty_t\":\"" AVAIL_TOPIC "\","
+    "\"pl_avail\":\"online\","
+    "\"pl_not_avail\":\"offline\","
     "\"dev\":{\"ids\":[\"weather_station_001\"],"
-    "\"name\":\"Weather Station\",\"mf\":\"DIY\"}";
+    "\"name\":\"Weather Station\",\"mf\":\"DIY\"}"
+    "}";
+
+  bool ok;
 
   // ── Temperature ──────────────────────────────────────────────────────────
-  {
-    String p = "{";
-    p += "\"name\":\"Outside Temperature\","
-         "\"uniq_id\":\"ws001_temp\","
-         "\"dev_cla\":\"temperature\","
-         "\"unit_of_meas\":\"\xc2\xb0""C\","   // °C (UTF-8)
-         "\"stat_t\":\"" STATE_TOPIC "\","
-         "\"val_tpl\":\"{{ value_json.temperature }}\","
-         "\"avty_t\":\"" AVAIL_TOPIC "\","
-         "\"pl_avail\":\"online\","
-         "\"pl_not_avail\":\"offline\",";
-    p += devFrag;
-    p += "}";
-    bool ok = client.publish(DISC_TEMP, p.c_str(), true);
-    Serial.print(ok ? "  ✓ temp   " : "  ✗ temp   ");
-    Serial.print(p.length()); Serial.println(" bytes");
-    delay(100);
-  }
+  snprintf(p, sizeof(p),
+    "{\"name\":\"Outside Temperature\","
+    "\"uniq_id\":\"ws001_temp\","
+    "\"dev_cla\":\"temperature\","
+    "\"unit_of_meas\":\"\xc2\xb0""C\","
+    "\"stat_t\":\"" STATE_TOPIC "\","
+    "\"val_tpl\":\"{{ value_json.temperature }}\","
+    "%s", sfx);
+  ok = client.publish(DISC_TEMP, p, true);
+  Serial.print(ok ? "  ✓ temp   " : "  ✗ temp   ");
+  Serial.print(strlen(p)); Serial.println(" bytes");
+  delay(100);
 
   // ── Humidity ─────────────────────────────────────────────────────────────
-  {
-    String p = "{";
-    p += "\"name\":\"Outside Humidity\","
-         "\"uniq_id\":\"ws001_humid\","
-         "\"dev_cla\":\"humidity\","
-         "\"unit_of_meas\":\"%\","
-         "\"stat_t\":\"" STATE_TOPIC "\","
-         "\"val_tpl\":\"{{ value_json.humidity }}\","
-         "\"avty_t\":\"" AVAIL_TOPIC "\","
-         "\"pl_avail\":\"online\","
-         "\"pl_not_avail\":\"offline\",";
-    p += devFrag;
-    p += "}";
-    bool ok = client.publish(DISC_HUMID, p.c_str(), true);
-    Serial.print(ok ? "  ✓ humid  " : "  ✗ humid  ");
-    Serial.print(p.length()); Serial.println(" bytes");
-    delay(100);
-  }
+  snprintf(p, sizeof(p),
+    "{\"name\":\"Outside Humidity\","
+    "\"uniq_id\":\"ws001_humid\","
+    "\"dev_cla\":\"humidity\","
+    "\"unit_of_meas\":\"%\","
+    "\"stat_t\":\"" STATE_TOPIC "\","
+    "\"val_tpl\":\"{{ value_json.humidity }}\","
+    "%s", sfx);
+  ok = client.publish(DISC_HUMID, p, true);
+  Serial.print(ok ? "  ✓ humid  " : "  ✗ humid  ");
+  Serial.print(strlen(p)); Serial.println(" bytes");
+  delay(100);
 
   // ── Precipitation label ───────────────────────────────────────────────────
-  {
-    String p = "{";
-    p += "\"name\":\"Outside Precipitation\","
-         "\"uniq_id\":\"ws001_precip\","
-         "\"stat_t\":\"" STATE_TOPIC "\","
-         "\"val_tpl\":\"{{ value_json.precip_label }}\","
-         "\"icon\":\"mdi:weather-rainy\","
-         "\"avty_t\":\"" AVAIL_TOPIC "\","
-         "\"pl_avail\":\"online\","
-         "\"pl_not_avail\":\"offline\",";
-    p += devFrag;
-    p += "}";
-    bool ok = client.publish(DISC_PRECIP, p.c_str(), true);
-    Serial.print(ok ? "  ✓ precip " : "  ✗ precip ");
-    Serial.print(p.length()); Serial.println(" bytes");
-    delay(100);
-  }
+  snprintf(p, sizeof(p),
+    "{\"name\":\"Outside Precipitation\","
+    "\"uniq_id\":\"ws001_precip\","
+    "\"stat_t\":\"" STATE_TOPIC "\","
+    "\"val_tpl\":\"{{ value_json.precip_label }}\","
+    "\"icon\":\"mdi:weather-rainy\","
+    "%s", sfx);
+  ok = client.publish(DISC_PRECIP, p, true);
+  Serial.print(ok ? "  ✓ precip " : "  ✗ precip ");
+  Serial.print(strlen(p)); Serial.println(" bytes");
+  delay(100);
 
   // ── Rain sensor raw (diagnostic) ─────────────────────────────────────────
-  {
-    String p = "{";
-    p += "\"name\":\"Rain Sensor Raw\","
-         "\"uniq_id\":\"ws001_rain_raw\","
-         "\"stat_t\":\"" STATE_TOPIC "\","
-         "\"val_tpl\":\"{{ value_json.rain_raw }}\","
-         "\"entity_cat\":\"diagnostic\","
-         "\"icon\":\"mdi:water-percent\","
-         "\"avty_t\":\"" AVAIL_TOPIC "\","
-         "\"pl_avail\":\"online\","
-         "\"pl_not_avail\":\"offline\",";
-    p += devFrag;
-    p += "}";
-    bool ok = client.publish(DISC_RAW, p.c_str(), true);
-    Serial.print(ok ? "  ✓ raw    " : "  ✗ raw    ");
-    Serial.print(p.length()); Serial.println(" bytes");
-    delay(100);
-  }
+  snprintf(p, sizeof(p),
+    "{\"name\":\"Rain Sensor Raw\","
+    "\"uniq_id\":\"ws001_rain_raw\","
+    "\"stat_t\":\"" STATE_TOPIC "\","
+    "\"val_tpl\":\"{{ value_json.rain_raw }}\","
+    "\"entity_cat\":\"diagnostic\","
+    "\"icon\":\"mdi:water-percent\","
+    "%s", sfx);
+  ok = client.publish(DISC_RAW, p, true);
+  Serial.print(ok ? "  ✓ raw    " : "  ✗ raw    ");
+  Serial.print(strlen(p)); Serial.println(" bytes");
+  delay(100);
 
   // ── SPS30: PM1.0 ─────────────────────────────────────────────────────────
-  {
-    String p = "{";
-    p += "\"name\":\"Air Quality PM1.0\","
-         "\"uniq_id\":\"ws001_pm1\","
-         "\"dev_cla\":\"pm1\","
-         "\"unit_of_meas\":\"\xc2\xb5g/m\xc2\xb3\","  // µg/m³ (UTF-8)
-         "\"stat_t\":\"" STATE_TOPIC "\","
-         "\"val_tpl\":\"{{ value_json.pm1 }}\","
-         "\"avty_t\":\"" AVAIL_TOPIC "\","
-         "\"pl_avail\":\"online\","
-         "\"pl_not_avail\":\"offline\",";
-    p += devFrag;
-    p += "}";
-    bool ok = client.publish(DISC_PM1, p.c_str(), true);
-    Serial.print(ok ? "  ✓ pm1    " : "  ✗ pm1    ");
-    Serial.print(p.length()); Serial.println(" bytes");
-    delay(100);
-  }
+  snprintf(p, sizeof(p),
+    "{\"name\":\"Air Quality PM1.0\","
+    "\"uniq_id\":\"ws001_pm1\","
+    "\"dev_cla\":\"pm1\","
+    "\"unit_of_meas\":\"\xc2\xb5g/m\xc2\xb3\","
+    "\"stat_t\":\"" STATE_TOPIC "\","
+    "\"val_tpl\":\"{{ value_json.pm1 }}\","
+    "%s", sfx);
+  ok = client.publish(DISC_PM1, p, true);
+  Serial.print(ok ? "  ✓ pm1    " : "  ✗ pm1    ");
+  Serial.print(strlen(p)); Serial.println(" bytes");
+  delay(100);
 
   // ── SPS30: PM2.5 ─────────────────────────────────────────────────────────
-  {
-    String p = "{";
-    p += "\"name\":\"Air Quality PM2.5\","
-         "\"uniq_id\":\"ws001_pm25\","
-         "\"dev_cla\":\"pm25\","
-         "\"unit_of_meas\":\"\xc2\xb5g/m\xc2\xb3\","
-         "\"stat_t\":\"" STATE_TOPIC "\","
-         "\"val_tpl\":\"{{ value_json.pm25 }}\","
-         "\"avty_t\":\"" AVAIL_TOPIC "\","
-         "\"pl_avail\":\"online\","
-         "\"pl_not_avail\":\"offline\",";
-    p += devFrag;
-    p += "}";
-    bool ok = client.publish(DISC_PM25, p.c_str(), true);
-    Serial.print(ok ? "  ✓ pm25   " : "  ✗ pm25   ");
-    Serial.print(p.length()); Serial.println(" bytes");
-    delay(100);
-  }
+  snprintf(p, sizeof(p),
+    "{\"name\":\"Air Quality PM2.5\","
+    "\"uniq_id\":\"ws001_pm25\","
+    "\"dev_cla\":\"pm25\","
+    "\"unit_of_meas\":\"\xc2\xb5g/m\xc2\xb3\","
+    "\"stat_t\":\"" STATE_TOPIC "\","
+    "\"val_tpl\":\"{{ value_json.pm25 }}\","
+    "%s", sfx);
+  ok = client.publish(DISC_PM25, p, true);
+  Serial.print(ok ? "  ✓ pm25   " : "  ✗ pm25   ");
+  Serial.print(strlen(p)); Serial.println(" bytes");
+  delay(100);
 
   // ── SPS30: PM4.0 ─────────────────────────────────────────────────────────
   // No standard HA device class for PM4; use air-filter icon instead.
-  {
-    String p = "{";
-    p += "\"name\":\"Air Quality PM4.0\","
-         "\"uniq_id\":\"ws001_pm4\","
-         "\"unit_of_meas\":\"\xc2\xb5g/m\xc2\xb3\","
-         "\"icon\":\"mdi:air-filter\","
-         "\"stat_t\":\"" STATE_TOPIC "\","
-         "\"val_tpl\":\"{{ value_json.pm4 }}\","
-         "\"avty_t\":\"" AVAIL_TOPIC "\","
-         "\"pl_avail\":\"online\","
-         "\"pl_not_avail\":\"offline\",";
-    p += devFrag;
-    p += "}";
-    bool ok = client.publish(DISC_PM4, p.c_str(), true);
-    Serial.print(ok ? "  ✓ pm4    " : "  ✗ pm4    ");
-    Serial.print(p.length()); Serial.println(" bytes");
-    delay(100);
-  }
+  snprintf(p, sizeof(p),
+    "{\"name\":\"Air Quality PM4.0\","
+    "\"uniq_id\":\"ws001_pm4\","
+    "\"unit_of_meas\":\"\xc2\xb5g/m\xc2\xb3\","
+    "\"icon\":\"mdi:air-filter\","
+    "\"stat_t\":\"" STATE_TOPIC "\","
+    "\"val_tpl\":\"{{ value_json.pm4 }}\","
+    "%s", sfx);
+  ok = client.publish(DISC_PM4, p, true);
+  Serial.print(ok ? "  ✓ pm4    " : "  ✗ pm4    ");
+  Serial.print(strlen(p)); Serial.println(" bytes");
+  delay(100);
 
   // ── SPS30: PM10.0 ────────────────────────────────────────────────────────
-  {
-    String p = "{";
-    p += "\"name\":\"Air Quality PM10.0\","
-         "\"uniq_id\":\"ws001_pm10\","
-         "\"dev_cla\":\"pm10\","
-         "\"unit_of_meas\":\"\xc2\xb5g/m\xc2\xb3\","
-         "\"stat_t\":\"" STATE_TOPIC "\","
-         "\"val_tpl\":\"{{ value_json.pm10 }}\","
-         "\"avty_t\":\"" AVAIL_TOPIC "\","
-         "\"pl_avail\":\"online\","
-         "\"pl_not_avail\":\"offline\",";
-    p += devFrag;
-    p += "}";
-    bool ok = client.publish(DISC_PM10, p.c_str(), true);
-    Serial.print(ok ? "  ✓ pm10   " : "  ✗ pm10   ");
-    Serial.print(p.length()); Serial.println(" bytes");
-    delay(100);
-  }
+  snprintf(p, sizeof(p),
+    "{\"name\":\"Air Quality PM10.0\","
+    "\"uniq_id\":\"ws001_pm10\","
+    "\"dev_cla\":\"pm10\","
+    "\"unit_of_meas\":\"\xc2\xb5g/m\xc2\xb3\","
+    "\"stat_t\":\"" STATE_TOPIC "\","
+    "\"val_tpl\":\"{{ value_json.pm10 }}\","
+    "%s", sfx);
+  ok = client.publish(DISC_PM10, p, true);
+  Serial.print(ok ? "  ✓ pm10   " : "  ✗ pm10   ");
+  Serial.print(strlen(p)); Serial.println(" bytes");
+  delay(100);
 
   Serial.println("Discovery complete.");
 }
@@ -620,6 +584,9 @@ void setup() {
   setupWiFi();
 
   client.setServer(mqtt_server, mqtt_port);
+  // Set buffer large enough for the biggest discovery payload (~430-byte packet).
+  // Called once here so the heap allocation happens before any fragmentation.
+  client.setBufferSize(768);
   // No inbound messages expected; no callback needed
 
   Serial.println("================================");
