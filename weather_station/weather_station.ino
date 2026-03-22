@@ -136,7 +136,8 @@ const char* mqtt_password = "mqtt_password";        // ← password for that use
 
 WiFiClient   espClient;
 PubSubClient client(espClient);
-unsigned long lastPublish    = 0;
+unsigned long lastPublish          = 0;
+unsigned long lastReconnectAttempt = 0;  // millis-based reconnect back-off
 unsigned long sps30StartedAt = 0;   // millis() when measurement was started
 bool          sps30Ready     = false; // true once warmup has elapsed
 bool          sps30Present   = false; // true only if sps30Begin() succeeded
@@ -509,7 +510,19 @@ void setupWiFi() {
   Serial.print(ssid);
   Serial.print("\"");
 
+  // Reset WiFi hardware before every begin().  A WDT reset leaves the radio
+  // in a partially initialised state that causes Exception(28)/excvaddr=0x38
+  // crashes on the next WiFi.begin() (esp8266/Arduino #4078, #6172).
+  // persistent(false) prevents credentials being written to flash, which can
+  // corrupt the config sector if a WDT fires mid-write and cause boot loops
+  // (#3852).
+  WiFi.persistent(false);
+  WiFi.setAutoConnect(false);
+  WiFi.setAutoReconnect(false);
   WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);   // clears stale lwIP PCBs left by the WDT reset
+  delay(100);              // SDK needs time to complete teardown — do not skip
+
   WiFi.begin(ssid, password);
 
   int attempts = 0;
@@ -609,6 +622,13 @@ void setup() {
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(mqttCallback);  // Prevents NULL-pointer crash if broker
                                      // sends an unexpected PUBLISH packet.
+  // CRITICAL: default socket timeout is 15 s.  PubSubClient's CONNACK-wait
+  // loop and readPacket() have no yield() call, so they block the CPU.
+  // At 15 s the hardware WDT (≈8 s) fires long before the timeout expires.
+  // Setting 2 s keeps every blocking section well under both the soft WDT
+  // (~3.2 s) and hard WDT (~8 s) thresholds.
+  // (knolleary/pubsubclient #1024, #583)
+  client.setSocketTimeout(2);
   if (!client.setBufferSize(768)) {
     Serial.println("✗ MQTT setBufferSize(768) FAILED — insufficient heap!");
     // Keep going; publish() will return false for large payloads but won't crash.
@@ -635,9 +655,14 @@ void setup() {
 
 void loop() {
   if (!client.connected()) {
-    reconnectMQTT();
-    if (!client.connected()) {
-      delay(5000);  // Back-off only on connection failure
+    // Non-blocking reconnect: attempt at most once every 5 s so that the
+    // main loop keeps returning promptly and the WDT stays fed.
+    // (Never call connect() every iteration — the CONNACK-wait loop blocks
+    // even with setSocketTimeout(2) and would stack up rapidly.)
+    unsigned long now = millis();
+    if (now - lastReconnectAttempt >= 5000UL) {
+      lastReconnectAttempt = now;
+      reconnectMQTT();
     }
     return;
   }
